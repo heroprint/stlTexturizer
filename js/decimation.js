@@ -42,8 +42,14 @@ import * as THREE from 'three';
 
 const QUANT         = 1e4;
 const FLIP_DOT      = 0.2;  // cos ~78° — reject collapse if new normal deviates more
+const FLIP_DOT_SQ   = FLIP_DOT * FLIP_DOT;
 const CREASE_COS    = 0.5;  // cos 60° — edges sharper than this are treated as creases
 const CREASE_WEIGHT = 1e4;  // quadric penalty weight for crease edges
+
+// Module-level scratch arrays for hasLinkViolation — avoids new Map() per call.
+// Size 128 exceeds the maximum practical vertex valence in any STL mesh.
+const _hlvHi = new Float64Array(128);
+const _hlvLo = new Int32Array(128);
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
@@ -57,13 +63,18 @@ export function decimate(geometry, targetTriangles, onProgress) {
   initQuadrics(quadrics, positions, faces, faceCount);
   addCreaseQuadrics(quadrics, positions, faces, faceCount);
 
-  // Vertex → set of incident face indices (Int32Arrays for cache efficiency)
-  const vertFaces  = buildAdjacency(faces, faceCount, vertCount);
-  const active     = new Uint8Array(vertCount).fill(1);
+  // Doubly-linked vertex-face incidence (typed arrays — faster than Set<number>)
+  const { vfHead, slotFace, slotVert, slotNext, slotPrev, faceSlot } =
+    buildLinkedAdj(faces, faceCount, vertCount);
+
+  const active  = new Uint8Array(vertCount).fill(1);
   // Per-vertex version counter: incremented whenever a vertex's quadric or
   // position changes.  Heap entries carry the versions at push time; any
   // entry whose versions no longer match is stale and is skipped.
-  const version    = new Uint32Array(vertCount);
+  const version = new Uint32Array(vertCount);
+  // Epoch stamp for neighbour deduplication — O(1) "clear" via epoch++
+  const nbStamp = new Uint32Array(vertCount);
+  let   epoch   = 1;
   let   activeFaces = faceCount;
 
   // Seed min-heap with one entry per unique edge.
@@ -99,13 +110,16 @@ export function decimate(geometry, targetTriangles, onProgress) {
     // Stale-entry checks (lazy deletion)
     if (!active[v1] || !active[v2]) continue;
     if (version[v1] !== ver1 || version[v2] !== ver2) continue;
-    if (!shareActiveFace(faces, vertFaces, v1, v2)) continue;
+
+    // Single pass combines the old shareActiveFace + isBoundaryEdge:
+    // 0 → stale entry, 1 → boundary edge (Guard 1), ≥2 → safe to continue
+    const nsh = sharedFaceCount(faces, vfHead, slotFace, slotNext, v1, v2);
+    if (nsh < 2) continue;
 
     // ── Three safety guards ───────────────────────────────────────────────────
-    if (isBoundaryEdge(faces, vertFaces, v1, v2))   continue;  // Guard 1
-    if (hasLinkViolation(faces, vertFaces, v1, v2)) continue;  // Guard 2
-    if (checkFlipped(positions, vertFaces, faces, v1, v2, px, py, pz)) continue; // Guard 3 v1-side
-    if (checkFlipped(positions, vertFaces, faces, v2, v1, px, py, pz)) continue; // Guard 3 v2-side
+    if (hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2)) continue;          // Guard 2
+    if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v1, v2, px, py, pz)) continue; // Guard 3a
+    if (checkFlipped(positions, vfHead, slotFace, slotNext, faces, v2, v1, px, py, pz)) continue; // Guard 3b
 
     // ── Collapse: keep v1 at new position, remove v2 ─────────────────────────
     positions[v1 * 3]     = px;
@@ -114,36 +128,46 @@ export function decimate(geometry, targetTriangles, onProgress) {
     mergeQuadric(quadrics, v1, v2);
     version[v1]++;  // v1's quadric and position changed — invalidate old heap entries
 
-    for (const f of vertFaces[v2]) {
-      if (faces[f * 3] < 0) continue;
-      for (let k = 0; k < 3; k++) {
-        if (faces[f * 3 + k] === v2) faces[f * 3 + k] = v1;
+    // Walk v2's face list; read sNext BEFORE modifying the list.
+    let s = vfHead[v2];
+    while (s >= 0) {
+      const f     = slotFace[s];
+      const sNext = slotNext[s]; // must be read before any list modification
+      if (faces[f * 3] >= 0) {
+        // Remap v2 → v1 in this face
+        const cv2 = faces[f*3] === v2 ? 0 : faces[f*3+1] === v2 ? 1 : 2;
+        faces[f * 3 + cv2] = v1;
+        const fa = faces[f*3], fb = faces[f*3+1], fc = faces[f*3+2];
+        if (fa === fb || fb === fc || fa === fc) {
+          // Degenerate: unlink all 3 slots from their current vertex lists
+          for (let k = 0; k < 3; k++) {
+            const sk = faceSlot[f*3+k];
+            if (sk >= 0) { _unlinkSlot(sk, vfHead, slotNext, slotPrev, slotVert); faceSlot[f*3+k] = -1; }
+          }
+          faces[f*3] = faces[f*3+1] = faces[f*3+2] = -1;
+          activeFaces--;
+        } else {
+          // Surviving: move the v2-slot (s) into v1's list; other 2 slots stay put
+          _moveSlot(s, v1, vfHead, slotNext, slotPrev, slotVert);
+        }
       }
-      const fa = faces[f * 3], fb = faces[f * 3 + 1], fc = faces[f * 3 + 2];
-      if (fa === fb || fb === fc || fa === fc) {
-        vertFaces[fa]?.delete(f);
-        vertFaces[fb]?.delete(f);
-        vertFaces[fc]?.delete(f);
-        faces[f * 3] = faces[f * 3 + 1] = faces[f * 3 + 2] = -1;
-        activeFaces--;
-      } else {
-        vertFaces[v1].add(f);
-      }
+      s = sNext;
     }
-    vertFaces[v2].clear();
+    // After the loop vfHead[v2] === -1 (all slots moved or freed)
     active[v2] = 0;
 
-    // Re-push edges for v1's updated neighbourhood
-    const neighbors = new Set();
-    for (const f of vertFaces[v1]) {
-      if (faces[f * 3] < 0) continue;
+    // Re-push edges for v1's updated neighbourhood (stamp dedup — no new Set)
+    epoch++;
+    for (let sv = vfHead[v1]; sv >= 0; sv = slotNext[sv]) {
+      const f = slotFace[sv];
+      if (faces[f*3] < 0) continue;
       for (let k = 0; k < 3; k++) {
-        const nb = faces[f * 3 + k];
-        if (nb !== v1) neighbors.add(nb);
+        const nb = faces[f*3+k];
+        if (nb !== v1 && nbStamp[nb] !== epoch) {
+          nbStamp[nb] = epoch;
+          if (active[nb]) pushEdge(heap, quadrics, positions, version, v1, nb);
+        }
       }
-    }
-    for (const nb of neighbors) {
-      if (active[nb]) pushEdge(heap, quadrics, positions, version, v1, nb);
     }
 
     if (onProgress && (++collapses & 511) === 0) {
@@ -156,96 +180,147 @@ export function decimate(geometry, targetTriangles, onProgress) {
   return buildOutput(positions, faces, faceCount);
 }
 
-// ── Guard 1: Boundary edge protection ───────────────────────────────────────
-// An edge is a boundary if fewer than 2 active faces share it.
-// Collapsing boundary edges is the primary cause of holes in open meshes.
+// ── Linked-list vertex-face incidence ────────────────────────────────────────
+// Replaces the old Array<Set<number>> adjacency.  For each face f and vertex
+// position k, slot s = f*3+k tracks face f in vertex v = faces[f*3+k]'s list.
+//
+//   vfHead[v]       → first slot for vertex v  (-1 = empty)
+//   slotFace[s]     → face tracked by slot s
+//   slotVert[s]     → vertex that currently owns slot s
+//   slotNext[s]     → next slot in vertex's list  (-1 = end)
+//   slotPrev[s]     → prev slot in vertex's list  (-1 = head)
+//   faceSlot[f*3+k] → slot for face f's k-th vertex incidence
 
-function isBoundaryEdge(faces, vertFaces, v1, v2) {
-  let shared = 0;
-  for (const f of vertFaces[v1]) {
+function buildLinkedAdj(faces, faceCount, vertCount) {
+  const S        = faceCount * 3;
+  const vfHead   = new Int32Array(vertCount).fill(-1);
+  const slotFace = new Int32Array(S);
+  const slotVert = new Int32Array(S);
+  const slotNext = new Int32Array(S).fill(-1);
+  const slotPrev = new Int32Array(S).fill(-1);
+  const faceSlot = new Int32Array(S).fill(-1);
+  for (let f = 0; f < faceCount; f++) {
     if (faces[f * 3] < 0) continue;
-    const fa = faces[f * 3], fb = faces[f * 3 + 1], fc = faces[f * 3 + 2];
-    if (fa === v2 || fb === v2 || fc === v2) { shared++; if (shared >= 2) return false; }
+    for (let k = 0; k < 3; k++) {
+      const v = faces[f * 3 + k];
+      const s = f * 3 + k;
+      slotFace[s] = f;
+      slotVert[s] = v;
+      const h = vfHead[v];
+      slotNext[s] = h;
+      slotPrev[s] = -1;
+      if (h >= 0) slotPrev[h] = s;
+      vfHead[v] = s;
+      faceSlot[f * 3 + k] = s;
+    }
   }
-  return shared < 2;
+  return { vfHead, slotFace, slotVert, slotNext, slotPrev, faceSlot };
+}
+
+// Remove slot s from its current vertex's list (slotVert[s] identifies the vertex).
+function _unlinkSlot(s, vfHead, slotNext, slotPrev, slotVert) {
+  const v = slotVert[s], p = slotPrev[s], n = slotNext[s];
+  if (p < 0) vfHead[v] = n; else slotNext[p] = n;
+  if (n >= 0) slotPrev[n] = p;
+}
+
+// Move slot s from its current vertex's list to vertex nv's list.
+function _moveSlot(s, nv, vfHead, slotNext, slotPrev, slotVert) {
+  _unlinkSlot(s, vfHead, slotNext, slotPrev, slotVert);
+  const h = vfHead[nv];
+  slotNext[s] = h;
+  slotPrev[s] = -1;
+  if (h >= 0) slotPrev[h] = s;
+  vfHead[nv] = s;
+  slotVert[s] = nv;
+}
+
+// ── Guard 0+1: combined shareActiveFace + isBoundaryEdge ─────────────────────
+// Returns 0 = stale entry, 1 = boundary edge, ≥2 = safe to proceed.
+
+function sharedFaceCount(faces, vfHead, slotFace, slotNext, v1, v2) {
+  let count = 0;
+  for (let s = vfHead[v1]; s >= 0; s = slotNext[s]) {
+    const f = slotFace[s];
+    if (faces[f * 3] < 0) continue;
+    const fa = faces[f*3], fb = faces[f*3+1], fc = faces[f*3+2];
+    if (fa === v2 || fb === v2 || fc === v2) { if (++count >= 2) return 2; }
+  }
+  return count;
 }
 
 // ── Guard 2: Duplicate-face / pinch prevention ───────────────────────────────
-// After collapsing v2 into v1, every face of v2 that survives (i.e. does not
-// share v1) gets v2 replaced by v1.  If any such remapped face is identical to
-// a face already incident to v1, the collapse would create a duplicate → reject.
+// Uses module-level scratch arrays (_hlvHi, _hlvLo) instead of new Map()
+// to avoid per-call heap allocation.
 
-function hasLinkViolation(faces, vertFaces, v1, v2) {
-  // Build a map of face signatures already incident to v1 (excluding shared faces).
-  // Each sorted triple (a,b,c) is encoded as hi=a*0x200000+b → [c…] for zero string allocation.
-  const v1Lo = new Map(); // hi → [c…]
-  for (const f of vertFaces[v1]) {
+function hasLinkViolation(faces, vfHead, slotFace, slotNext, v1, v2) {
+  let n = 0;
+  for (let s = vfHead[v1]; s >= 0; s = slotNext[s]) {
+    const f = slotFace[s];
     if (faces[f * 3] < 0) continue;
-    let fa = faces[f * 3], fb = faces[f * 3 + 1], fc = faces[f * 3 + 2];
+    let fa = faces[f*3], fb = faces[f*3+1], fc = faces[f*3+2];
     if (fa === v2 || fb === v2 || fc === v2) continue;
-    // Sort triple
     let t;
     if (fa > fb) { t = fa; fa = fb; fb = t; }
     if (fb > fc) { t = fb; fb = fc; fc = t; }
     if (fa > fb) { t = fa; fa = fb; fb = t; }
-    const hi = fa * 0x200000 + fb;
-    // Store hi→[lo…] mapping
-    let arr = v1Lo.get(hi);
-    if (!arr) { arr = []; v1Lo.set(hi, arr); }
-    arr.push(fc);
+    _hlvHi[n] = fa * 0x200000 + fb;
+    _hlvLo[n] = fc;
+    n++;
   }
-
-  for (const f of vertFaces[v2]) {
+  for (let s = vfHead[v2]; s >= 0; s = slotNext[s]) {
+    const f = slotFace[s];
     if (faces[f * 3] < 0) continue;
-    let fa = faces[f * 3], fb = faces[f * 3 + 1], fc = faces[f * 3 + 2];
+    let fa = faces[f*3], fb = faces[f*3+1], fc = faces[f*3+2];
     if (fa === v1 || fb === v1 || fc === v1) continue;
-    // Remap v2 → v1
     if (fa === v2) fa = v1; else if (fb === v2) fb = v1; else fc = v1;
     let t;
     if (fa > fb) { t = fa; fa = fb; fb = t; }
     if (fb > fc) { t = fb; fb = fc; fc = t; }
     if (fa > fb) { t = fa; fa = fb; fb = t; }
     const hi = fa * 0x200000 + fb;
-    const arr = v1Lo.get(hi);
-    if (arr) {
-      for (let i = 0; i < arr.length; i++) if (arr[i] === fc) return true;
+    for (let i = 0; i < n; i++) {
+      if (_hlvHi[i] === hi && _hlvLo[i] === fc) return true;
     }
   }
   return false;
 }
 
 // ── Guard 3: Normal-flip rejection ──────────────────────────────────────────
-// After hypothetical collapse of v_collapse → (npx,npy,npz), recompute normals
-// of all affected faces.  If any flip by more than ~78° (dot < FLIP_DOT) reject.
+// Fully inlined — no array allocations, no sqrt calls.
+// Squared-dot comparison replaces the normalized dot product:
+//   dot(on_norm, nn_norm) < FLIP_DOT
+//   ⟺  rawDot < 0  OR  rawDot² < FLIP_DOT² · |on|² · |nn|²
 
-function checkFlipped(positions, vertFaces, faces, v_collapse, v_other, npx, npy, npz) {
-  for (const f of vertFaces[v_collapse]) {
+function checkFlipped(positions, vfHead, slotFace, slotNext, faces, vc, vo, npx, npy, npz) {
+  for (let s = vfHead[vc]; s >= 0; s = slotNext[s]) {
+    const f = slotFace[s];
     if (faces[f * 3] < 0) continue;
-    const fa = faces[f * 3], fb = faces[f * 3 + 1], fc = faces[f * 3 + 2];
-    // Skip faces shared with v_other; they will be deleted on collapse
-    if (fa === v_other || fb === v_other || fc === v_other) continue;
-
-    // Original normal
-    const [onx, ony, onz] = faceNormal(
-      positions[fa*3], positions[fa*3+1], positions[fa*3+2],
-      positions[fb*3], positions[fb*3+1], positions[fb*3+2],
-      positions[fc*3], positions[fc*3+1], positions[fc*3+2]
-    );
-
-    // New normal with v_collapse replaced by new position
-    const ax = fa === v_collapse ? npx : positions[fa*3];
-    const ay = fa === v_collapse ? npy : positions[fa*3+1];
-    const az = fa === v_collapse ? npz : positions[fa*3+2];
-    const bx = fb === v_collapse ? npx : positions[fb*3];
-    const by = fb === v_collapse ? npy : positions[fb*3+1];
-    const bz = fb === v_collapse ? npz : positions[fb*3+2];
-    const cx = fc === v_collapse ? npx : positions[fc*3];
-    const cy = fc === v_collapse ? npy : positions[fc*3+1];
-    const cz = fc === v_collapse ? npz : positions[fc*3+2];
-    const [nnx, nny, nnz] = faceNormal(ax, ay, az, bx, by, bz, cx, cy, cz);
-
-    const dot = onx * nnx + ony * nny + onz * nnz;
-    if (dot < FLIP_DOT) return true;
+    const fa = faces[f*3], fb = faces[f*3+1], fc = faces[f*3+2];
+    if (fa === vo || fb === vo || fc === vo) continue;
+    const oax = positions[fa*3], oay = positions[fa*3+1], oaz = positions[fa*3+2];
+    const obx = positions[fb*3], oby = positions[fb*3+1], obz = positions[fb*3+2];
+    const ocx = positions[fc*3], ocy = positions[fc*3+1], ocz = positions[fc*3+2];
+    // Unnormalized original normal
+    const oux = obx-oax, ouy = oby-oay, ouz = obz-oaz;
+    const ovx = ocx-oax, ovy = ocy-oay, ovz = ocz-oaz;
+    const onx = ouy*ovz - ouz*ovy;
+    const ony = ouz*ovx - oux*ovz;
+    const onz = oux*ovy - ouy*ovx;
+    // New positions (vc replaced by np)
+    const nax = fa===vc ? npx : oax, nay = fa===vc ? npy : oay, naz = fa===vc ? npz : oaz;
+    const nbx = fb===vc ? npx : obx, nby = fb===vc ? npy : oby, nbz = fb===vc ? npz : obz;
+    const ncx = fc===vc ? npx : ocx, ncy = fc===vc ? npy : ocy, ncz = fc===vc ? npz : ocz;
+    // Unnormalized new normal
+    const nux = nbx-nax, nuy = nby-nay, nuz = nbz-naz;
+    const nvx = ncx-nax, nvy = ncy-nay, nvz = ncz-naz;
+    const nnx = nuy*nvz - nuz*nvy;
+    const nny = nuz*nvx - nux*nvz;
+    const nnz = nux*nvy - nuy*nvx;
+    // Squared-dot flip test (avoids sqrt + division)
+    const rawDot = onx*nnx + ony*nny + onz*nnz;
+    if (rawDot < 0) return true;
+    if (rawDot * rawDot < FLIP_DOT_SQ * (onx*onx+ony*ony+onz*onz) * (nnx*nnx+nny*nny+nnz*nnz)) return true;
   }
   return false;
 }
@@ -471,28 +546,7 @@ function buildIndexed(geometry) {
   return { positions: positions.subarray(0, vertCount * 3), faces, vertCount, faceCount };
 }
 
-// ── Adjacency helpers ────────────────────────────────────────────────────────
-
-function buildAdjacency(faces, faceCount, vertCount) {
-  const adj = new Array(vertCount);
-  for (let v = 0; v < vertCount; v++) adj[v] = new Set();
-  for (let f = 0; f < faceCount; f++) {
-    if (faces[f * 3] < 0) continue;
-    adj[faces[f * 3]].add(f);
-    adj[faces[f * 3 + 1]].add(f);
-    adj[faces[f * 3 + 2]].add(f);
-  }
-  return adj;
-}
-
-function shareActiveFace(faces, vertFaces, v1, v2) {
-  for (const f of vertFaces[v1]) {
-    if (faces[f * 3] < 0) continue;
-    const fa = faces[f * 3], fb = faces[f * 3 + 1], fc = faces[f * 3 + 2];
-    if (fa === v2 || fb === v2 || fc === v2) return true;
-  }
-  return false;
-}
+// (adjacency helpers replaced by buildLinkedAdj and _unlinkSlot/_moveSlot above)
 
 function buildOutput(positions, faces, faceCount) {
   let activeFaces = 0;
