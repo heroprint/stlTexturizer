@@ -136,14 +136,20 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
       tmpPos.fromBufferAttribute(posAttr, t + v);
       const k = posKey(tmpPos.x, tmpPos.y, tmpPos.z);
       if (userExcluded && excludedPosSet) excludedPosSet.add(k);
-      tmpNrm.fromBufferAttribute(nrmAttr, t + v);
+      // Use the geometric face normal (faceNrm = cross product, length ∝ 2×area)
+      // instead of the buffer normal.  The subdivision pipeline interpolates
+      // smooth normals at midpoints, which propagates the 45° edge tilt deep
+      // into the face interior across iterations.  Using the true face normal
+      // ensures interior vertices on flat faces get a perfectly perpendicular
+      // smooth normal, limiting the angled displacement to the single outermost
+      // vertex row at each hard edge — matching addSmoothNormals() in main.js.
       const existing = smoothNrmMap.get(k);
       if (existing) {
-        existing[0] += tmpNrm.x * faceArea;
-        existing[1] += tmpNrm.y * faceArea;
-        existing[2] += tmpNrm.z * faceArea;
+        existing[0] += faceNrm.x;
+        existing[1] += faceNrm.y;
+        existing[2] += faceNrm.z;
       } else {
-        smoothNrmMap.set(k, [tmpNrm.x * faceArea, tmpNrm.y * faceArea, tmpNrm.z * faceArea]);
+        smoothNrmMap.set(k, [faceNrm.x, faceNrm.y, faceNrm.z]);
       }
       if (czX > 1e-12 || czY > 1e-12 || czZ > 1e-12) {
         const za = zoneAreaMap.get(k);

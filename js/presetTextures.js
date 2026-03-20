@@ -5,10 +5,25 @@ const THUMB = 80;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function makeCanvas(size = SIZE) {
+function makeCanvas(w, h = w) {
   const c = document.createElement('canvas');
-  c.width = c.height = size;
+  c.width  = w;
+  c.height = h;
   return c;
+}
+
+/** Draw img into a square canvas using cover-scaling (preserves aspect ratio, center-crops). */
+function drawCover(ctx, img, size) {
+  const scale = Math.max(size / img.width, size / img.height);
+  const w = img.width  * scale;
+  const h = img.height * scale;
+  ctx.drawImage(img, (size - w) / 2, (size - h) / 2, w, h);
+}
+
+/** Return { w, h } capped at SIZE on the longest side, preserving aspect ratio. */
+function fitDimensions(imgW, imgH) {
+  const scale = Math.min(SIZE / imgW, SIZE / imgH, 1);
+  return { w: Math.round(imgW * scale), h: Math.round(imgH * scale) };
 }
 
 // ── Image-based presets ───────────────────────────────────────────────────────
@@ -32,18 +47,19 @@ function loadImagePreset({ name, url }) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const full = makeCanvas(SIZE);
-      full.getContext('2d').drawImage(img, 0, 0, SIZE, SIZE);
+      const { w, h } = fitDimensions(img.width, img.height);
+      const full = makeCanvas(w, h);
+      full.getContext('2d').drawImage(img, 0, 0, w, h);
 
       const thumb = makeCanvas(THUMB);
-      thumb.getContext('2d').drawImage(img, 0, 0, THUMB, THUMB);
+      drawCover(thumb.getContext('2d'), img, THUMB);
 
-      const imageData = full.getContext('2d').getImageData(0, 0, SIZE, SIZE);
+      const imageData = full.getContext('2d').getImageData(0, 0, w, h);
       const texture   = new THREE.CanvasTexture(full);
       texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
       texture.name = name;
 
-      resolve({ name, thumbCanvas: thumb, fullCanvas: full, texture, imageData, width: SIZE, height: SIZE });
+      resolve({ name, thumbCanvas: thumb, fullCanvas: full, texture, imageData, width: w, height: h });
     };
     img.onerror = () => reject(new Error(`Failed to load preset image: ${url}`));
     img.src = url;
@@ -64,14 +80,15 @@ export function loadCustomTexture(file) {
     const url = URL.createObjectURL(file);
     img.onload = () => {
       URL.revokeObjectURL(url);
-      const canvas = makeCanvas(SIZE);
+      const { w, h } = fitDimensions(img.width, img.height);
+      const canvas = makeCanvas(w, h);
       const ctx    = canvas.getContext('2d');
-      ctx.drawImage(img, 0, 0, SIZE, SIZE);
-      const imageData = ctx.getImageData(0, 0, SIZE, SIZE);
+      ctx.drawImage(img, 0, 0, w, h);
+      const imageData = ctx.getImageData(0, 0, w, h);
       const texture   = new THREE.CanvasTexture(canvas);
       texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
       texture.name = file.name;
-      resolve({ name: file.name, fullCanvas: canvas, texture, imageData, width: SIZE, height: SIZE });
+      resolve({ name: file.name, fullCanvas: canvas, texture, imageData, width: w, height: h });
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Failed to load image')); };
     img.src = url;
