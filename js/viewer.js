@@ -185,6 +185,68 @@ export function initViewer(canvas) {
   controls.screenSpacePanning = true;
   controls.enableZoom = false; // we handle zoom ourselves for cursor-centric behaviour
 
+  // Raycast-based orbit pivot: when left-drag starts on the model, orbit
+  // around the surface point under the cursor instead of the default target.
+  // We disable OrbitControls' own rotation and handle it manually so that
+  // neither the camera view nor the target "snaps" to the clicked point.
+  const _orbitRaycaster = new THREE.Raycaster();
+  let _customPivot = null;
+  let _lastPointer = null;
+
+  renderer.domElement.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || !controls.enabled) return;
+    if (!currentMesh) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width)  *  2 - 1,
+      ((e.clientY - rect.top)  / rect.height) * -2 + 1,
+    );
+    _orbitRaycaster.setFromCamera(ndc, camera);
+    const hits = _orbitRaycaster.intersectObject(currentMesh);
+    if (hits.length) {
+      _customPivot  = hits[0].point.clone();
+      _lastPointer  = { x: e.clientX, y: e.clientY };
+      controls.enableRotate = false;   // we'll rotate manually
+    }
+  });
+
+  document.addEventListener('pointermove', (e) => {
+    if (!_customPivot || !_lastPointer || !controls.enabled) return;
+    const dx = e.clientX - _lastPointer.x;
+    const dy = e.clientY - _lastPointer.y;
+    _lastPointer = { x: e.clientX, y: e.clientY };
+    if (dx === 0 && dy === 0) return;
+
+    const rotSpeed = 0.005;
+    // Horizontal: rotate around world Z (up)
+    const qH = new THREE.Quaternion().setFromAxisAngle(
+      new THREE.Vector3(0, 0, 1), -dx * rotSpeed);
+    // Vertical: rotate around camera's local X (right vector)
+    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    const qV = new THREE.Quaternion().setFromAxisAngle(right, -dy * rotSpeed);
+    const qTotal = new THREE.Quaternion().multiplyQuaternions(qV, qH);
+
+    // Rotate camera position around the pivot
+    const camOff = camera.position.clone().sub(_customPivot);
+    camOff.applyQuaternion(qTotal);
+    camera.position.copy(_customPivot).add(camOff);
+
+    // Rotate orbit target around the same pivot so OrbitControls stays in sync
+    const tgtOff = controls.target.clone().sub(_customPivot);
+    tgtOff.applyQuaternion(qTotal);
+    controls.target.copy(_customPivot).add(tgtOff);
+
+    camera.lookAt(controls.target);
+  });
+
+  document.addEventListener('pointerup', () => {
+    if (_customPivot) {
+      _customPivot  = null;
+      _lastPointer  = null;
+      controls.enableRotate = true;
+    }
+  });
+
   // Cursor-centric zoom: zoom toward the mouse pointer instead of screen centre
   renderer.domElement.addEventListener('wheel', (e) => {
     e.preventDefault();
