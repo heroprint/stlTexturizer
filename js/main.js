@@ -1536,6 +1536,9 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
 
   if (falloff <= 0) {
     geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
+    const defaultType = new Float32Array(posCount);
+    defaultType.fill(1.0);
+    geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(defaultType, 1));
     return;
   }
 
@@ -1543,9 +1546,10 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   // Mirrors the vertex shader logic so the preview boundary matches export.
   const faceNrmAttr = geometry.attributes.faceNormal;
   const faceMask = new Float32Array(triCount); // 0 = masked, 1 = textured
+  const isUserMasked = new Uint8Array(triCount); // 1 if user-excluded
   for (let t = 0; t < triCount; t++) {
     const userVal = userMaskArr[t * 3]; // same for all 3 verts of this face
-    if (userVal < 0.5) { faceMask[t] = 0; continue; }
+    if (userVal < 0.5) { faceMask[t] = 0; isUserMasked[t] = 1; continue; }
 
     let angleMask = 1.0;
     if (faceNrmAttr) {
@@ -1571,6 +1575,7 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   const posFromKey = new Map();  // posKey → [x, y, z]
   // Per-position: [maskedArea, totalArea] to find boundary vertices
   const maskFracMap = new Map();
+  const userMaskAreaMap = new Map(); // posKey → area of user-masked faces
   const tmpV = new THREE.Vector3();
   const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
   const e1 = new THREE.Vector3(), e2 = new THREE.Vector3(), fn = new THREE.Vector3();
@@ -1596,19 +1601,31 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
       } else {
         maskFracMap.set(k, [masked ? area : 0, area]);
       }
+      // Track user-mask area per position to classify boundary type
+      if (isUserMasked[t]) {
+        const prev = userMaskAreaMap.get(k) || 0;
+        userMaskAreaMap.set(k, prev + area);
+      }
     }
   }
 
-  // Boundary positions: shared between masked and non-masked faces
+  // Boundary positions: shared between masked and non-masked faces.
+  // Each entry: [x, y, z, maskType] where maskType 0 = user, 1 = angle.
   const boundaryPositions = [];
   for (const [k, pos] of posFromKey) {
     const mf = maskFracMap.get(k);
     const frac = mf[1] > 0 ? mf[0] / mf[1] : 0;
-    if (frac > 0 && frac < 1) boundaryPositions.push(pos);
+    if (frac > 0 && frac < 1) {
+      const userArea = userMaskAreaMap.get(k) || 0;
+      boundaryPositions.push([pos[0], pos[1], pos[2], userArea > 0 ? 0 : 1]);
+    }
   }
 
   if (boundaryPositions.length === 0) {
     geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
+    const defaultType = new Float32Array(posCount);
+    defaultType.fill(1.0);
+    geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(defaultType, 1));
     return;
   }
 
@@ -1644,15 +1661,21 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
   const searchY = Math.ceil(falloff / gDy);
   const searchZ = Math.ceil(falloff / gDz);
 
-  // Compute per-unique-position falloff factor
+  // Compute per-unique-position falloff factor and mask type
   const falloffCache = new Map(); // posKey → factor [0,1]
+  const maskTypeCache = new Map(); // posKey → 0 (user mask) or 1 (angle mask)
   for (const [k, pos] of posFromKey) {
     const mf = maskFracMap.get(k);
     const frac = mf[1] > 0 ? mf[0] / mf[1] : 0;
     if (frac >= 1) continue; // fully masked vertex — keep 1.0 (mask zeroes it anyway)
     // Boundary vertices (shared between masked and unmasked faces) are AT
     // the boundary → distance 0 → falloff factor 0.
-    if (frac > 0) { falloffCache.set(k, 0); continue; }
+    if (frac > 0) {
+      falloffCache.set(k, 0);
+      const userArea = userMaskAreaMap.get(k) || 0;
+      maskTypeCache.set(k, userArea > 0 ? 0 : 1);
+      continue;
+    }
 
     const px = pos[0], py = pos[1], pz = pos[2];
     const cix = Math.max(0, Math.min(gRes - 1, Math.floor((px - gMinX) / gDx)));
@@ -1660,6 +1683,7 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
     const ciz = Math.max(0, Math.min(gRes - 1, Math.floor((pz - gMinZ) / gDz)));
 
     let minDist2 = falloff * falloff;
+    let nearestType = 1; // default: angle mask
     for (let dix = -searchX; dix <= searchX; dix++) {
       const nix = cix + dix;
       if (nix < 0 || nix >= gRes) continue;
@@ -1674,24 +1698,31 @@ function computeBoundaryFalloffAttr(geometry, userMaskArr) {
           for (const bp of cell) {
             const dx = px - bp[0], dy = py - bp[1], dz = pz - bp[2];
             const d2 = dx * dx + dy * dy + dz * dz;
-            if (d2 < minDist2) minDist2 = d2;
+            if (d2 < minDist2) { minDist2 = d2; nearestType = bp[3]; }
           }
         }
       }
     }
     const dist = Math.sqrt(minDist2);
     const factor = Math.min(1, dist / falloff);
-    if (factor < 1) falloffCache.set(k, factor);
+    if (factor < 1) {
+      falloffCache.set(k, factor);
+      maskTypeCache.set(k, nearestType);
+    }
   }
 
-  // Write per-vertex attribute
+  // Write per-vertex attributes
+  const maskTypeArr = new Float32Array(posCount);
+  maskTypeArr.fill(1.0); // default: angle mask (grey)
   for (let i = 0; i < posCount; i++) {
     tmpV.fromBufferAttribute(posAttr, i);
     const k = posKey(tmpV.x, tmpV.y, tmpV.z);
     if (falloffCache.has(k)) falloffArr[i] = falloffCache.get(k);
+    if (maskTypeCache.has(k)) maskTypeArr[i] = maskTypeCache.get(k);
   }
 
   geometry.setAttribute('boundaryFalloffAttr', new THREE.Float32BufferAttribute(falloffArr, 1));
+  geometry.setAttribute('boundaryMaskTypeAttr', new THREE.Float32BufferAttribute(maskTypeArr, 1));
 }
 
 /**

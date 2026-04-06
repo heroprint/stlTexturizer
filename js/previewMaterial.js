@@ -203,12 +203,15 @@ const vertexShader = /* glsl */`
   attribute vec3  faceNormal;
   attribute float faceMask;
   attribute float boundaryFalloffAttr;
+  attribute float boundaryMaskTypeAttr;
 
   varying vec3  vModelPos;    // ORIGINAL model-space position → UV computation in fragment
   varying vec3  vModelNormal; // model-space face normal       → stable UV blending
   varying vec3  vViewPos;     // view-space position (possibly displaced) → TBN & specular
   varying vec3  vNormal;      // view-space normal → lighting
   varying float vFaceMask;    // combined mask (angle + user exclusion + boundary falloff)
+  varying float vUserMask;    // raw user-exclusion mask (0 = user-excluded, 1 = included)
+  varying float vMaskType;    // boundary mask type (0 = user mask, 1 = angle mask)
 
   void main() {
     vec3 safeN = length(normal) > 1e-6 ? normalize(normal) : vec3(0.0, 0.0, 1.0);
@@ -226,6 +229,8 @@ const vertexShader = /* glsl */`
       angleMask = min(angleMask, surfaceAngle > topAngleLimit ? 1.0 : 0.0);
     float totalMask = angleMask * faceMask * boundaryFalloffAttr;
     vFaceMask = totalMask;
+    vUserMask = faceMask;
+    vMaskType = boundaryMaskTypeAttr;
 
     if (useDisplacement == 1) {
       float h = computeHeightAtPoint(position, safeN, safeN);
@@ -262,6 +267,8 @@ const fragmentShader = /* glsl */`
   varying vec3  vViewPos;
   varying vec3  vNormal;
   varying float vFaceMask;
+  varying float vUserMask;
+  varying float vMaskType;
 
   // Fragment-only wrapper: compute face-stable projection normal via dFdx
   // then delegate to the shared height function.
@@ -334,7 +341,19 @@ const fragmentShader = /* glsl */`
     vec3 bumpN = length(bumpVec) > 1e-6 ? normalize(bumpVec) : N;
 
     // ── Shading ───────────────────────────────────────────────────────────
-    vec3 baseColor = mix(vec3(0.50, 0.50, 0.50), vec3(0.22, 0.68, 0.68), maskBlend);
+    // Use consistent teal base for all areas so lighting looks uniform.
+    // Mask type determines the tint colour for masked/falloff regions:
+    //   user mask (vMaskType ≈ 0) → warm red-orange
+    //   angle mask (vMaskType ≈ 1) → neutral grey
+    vec3 tealBase     = vec3(0.22, 0.68, 0.68);
+    vec3 userMaskTint = vec3(0.55, 0.22, 0.12);
+    vec3 angleMaskTint = vec3(0.45, 0.48, 0.50);
+
+    float maskEffect = 1.0 - maskBlend; // 0 = fully textured, 1 = fully masked
+    // On user-excluded faces (vUserMask ≈ 0) force user tint regardless of vMaskType
+    float effectiveMaskType = mix(vMaskType, 0.0, step(0.5, 1.0 - vUserMask));
+    vec3 maskTint = mix(userMaskTint, angleMaskTint, effectiveMaskType);
+    vec3 baseColor = mix(tealBase, maskTint, maskEffect * 0.6);
 
     vec3 L1 = normalize(vec3( 0.5,  0.8,  1.0));
     vec3 L2 = normalize(vec3(-0.5, -0.2, -0.6));
