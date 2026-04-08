@@ -13,6 +13,7 @@ export default {
   "sections.displacementMap": "Mapa de deslocamento",
   "ui.uploadCustomMap": "Enviar mapa personalizado",
   "ui.noMapSelected": "Nenhum mapa selecionado",
+  "ui.loadingTextures": "Carregando texturas…",
   "sections.projection": "Projeção",
   "labels.mode": "Modo",
   "projection.triplanar": "Triplanar",

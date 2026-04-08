@@ -13,6 +13,7 @@ export default {
   "sections.displacementMap": "Mappa di Deformazione",
   "ui.uploadCustomMap": "Carica mappa personalizzata",
   "ui.noMapSelected": "Nessuna mappa selezionata",
+  "ui.loadingTextures": "Caricamento texture…",
   "sections.projection": "Proiezione",
   "labels.mode": "Modalità",
   "projection.triplanar": "Triplanare",

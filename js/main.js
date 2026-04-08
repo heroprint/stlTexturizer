@@ -4,7 +4,7 @@ import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWirefram
          setExclusionOverlay, setHoverPreview, setViewerTheme,
          setProjection, requestRender } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
-import { loadPresets, loadCustomTexture }  from './presetTextures.js';
+import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
 import { subdivide }          from './subdivision.js';
 import { applyDisplacement }  from './displacement.js';
@@ -50,6 +50,11 @@ let _shiftLineMesh     = null;        // THREE.Line — preview line from last p
 let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
+
+// ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
+let _spatialGrid = null;
+let _spatialCellSize = 0;
+let _spatialMinX = 0, _spatialMinY = 0, _spatialMinZ = 0;
 
 const settings = {
   mappingMode:   5,     // Triplanar default
@@ -273,11 +278,11 @@ const languageSelector = document.querySelector('.lang-seg');
 // Middle position 500 → scale ~0.71 (log midpoint between 0.05 and 10).
 const _LOG_MIN = Math.log(0.05);
 const _LOG_MAX = Math.log(10);
-const scaleToPos = v => Math.round((Math.log(Math.max(0.05, Math.min(10, v))) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000);
+const scaleToPos = v => Math.round(Math.max(0, Math.min(1000, (Math.log(Math.max(0.01, Math.min(10, v))) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000)));
 const posToScale = p => parseFloat(Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - _LOG_MIN)).toFixed(2));
 
 function _applyScaleU(v) {
-  v = Math.max(0.05, Math.min(10, v));
+  v = Math.max(0.01, Math.min(10, v));
   settings.scaleU = v;
   scaleUSlider.value = scaleToPos(v);
   scaleUVal.value = v;
@@ -370,45 +375,57 @@ wireEvents();
 scaleUVal.value = posToScale(parseFloat(scaleUSlider.value));
 scaleVVal.value = posToScale(parseFloat(scaleVSlider.value));
 
-loadPresets().then(presets => {
-  PRESETS = presets;
-  buildPresetGrid();
-  loadDefaultCube();
-  // Select Crystal as the default preset
-  const noiseIdx = PRESETS.findIndex(p => p.name === 'Crystal');
-  const defaultIdx = noiseIdx !== -1 ? noiseIdx : 0;
-  const swatches = presetGrid.querySelectorAll('.preset-swatch');
-  if (swatches[defaultIdx]) selectPreset(defaultIdx, swatches[defaultIdx]);
-}).catch(err => console.error('Failed to load preset textures:', err));
+// Load geometry immediately — don't wait for textures
+loadDefaultCube();
+
+// Build swatches with placeholder canvases, then load thumbnails
+const DEFAULT_PRESET_NAME = 'Crystal';
+const _presetSwatches = IMAGE_PRESETS.map((p, idx) => {
+  const swatch = document.createElement('div');
+  swatch.className = 'preset-swatch preset-loading';
+  swatch.setAttribute('role', 'button');
+  swatch.setAttribute('tabindex', '0');
+  swatch.title = p.name;
+
+  const placeholder = document.createElement('canvas');
+  placeholder.width = 80; placeholder.height = 80;
+  swatch.appendChild(placeholder);
+
+  const label = document.createElement('span');
+  label.className = 'preset-label';
+  label.textContent = p.name;
+  swatch.appendChild(label);
+
+  swatch.addEventListener('click', () => selectPreset(idx, swatch));
+  swatch.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      selectPreset(idx, swatch);
+    }
+  });
+  presetGrid.appendChild(swatch);
+  return swatch;
+});
+
+// Load lightweight thumbnails (~49 KB total), then auto-select Crystal
+loadAllThumbnails().then(thumbs => {
+  thumbs.forEach((thumb, idx) => {
+    if (!thumb) return;
+    PRESETS[idx] = thumb;         // thumbnail-only entry for now
+    const swatch = _presetSwatches[idx];
+    if (!swatch) return;
+    swatch.classList.remove('preset-loading');
+    const placeholder = swatch.querySelector('canvas');
+    swatch.replaceChild(thumb.thumbCanvas, placeholder);
+  });
+  // Auto-select the default preset
+  const crystalIdx = IMAGE_PRESETS.findIndex(p => p.name === DEFAULT_PRESET_NAME);
+  if (crystalIdx >= 0 && PRESETS[crystalIdx]) {
+    selectPreset(crystalIdx, _presetSwatches[crystalIdx]);
+  }
+}).catch(err => console.error('Failed to load thumbnails:', err));
 
 // ── Preset grid ───────────────────────────────────────────────────────────────
-
-function buildPresetGrid() {
-  PRESETS.forEach((preset, idx) => {
-    const swatch = document.createElement('div');
-    swatch.className = 'preset-swatch';
-    swatch.setAttribute('role', 'button');
-    swatch.setAttribute('tabindex', '0');
-    swatch.title = preset.name;
-
-    // Use the small thumbnail canvas
-    swatch.appendChild(preset.thumbCanvas);
-
-    const label = document.createElement('span');
-    label.className = 'preset-label';
-    label.textContent = preset.name;
-    swatch.appendChild(label);
-
-    swatch.addEventListener('click', () => selectPreset(idx, swatch));
-    swatch.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        selectPreset(idx, swatch);
-      }
-    });
-    presetGrid.appendChild(swatch);
-  });
-}
 
 function resetTextureSmoothing() {
   settings.textureSmoothing = 0;
@@ -416,14 +433,39 @@ function resetTextureSmoothing() {
   textureSmoothingVal.value    = 0;
 }
 
-function selectPreset(idx, swatchEl) {
+let _selectGeneration = 0;   // debounce rapid preset clicks
+
+async function selectPreset(idx, swatchEl) {
+  const gen = ++_selectGeneration;
   document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
   swatchEl.classList.add('active');
-  activeMapEntry = PRESETS[idx];
-  activeMapName.textContent = PRESETS[idx].name;
+
+  const entry = PRESETS[idx];
+  if (!entry) return;
+  activeMapName.textContent = entry.name;
   resetTextureSmoothing();
-  if (activeMapEntry.defaultScale != null) _applyScaleU(activeMapEntry.defaultScale);
-  updatePreview();
+  if (entry.defaultScale != null) _applyScaleU(entry.defaultScale);
+
+  // If full texture is already loaded, use it directly
+  if (entry.texture) {
+    activeMapEntry = entry;
+    updatePreview();
+    return;
+  }
+
+  // Load full-resolution texture on demand
+  swatchEl.classList.add('preset-loading-full');
+  try {
+    const full = await loadFullPreset(idx);
+    if (gen !== _selectGeneration) return;   // user clicked another preset meanwhile
+    PRESETS[idx] = { ...entry, ...full };
+    activeMapEntry = PRESETS[idx];
+    swatchEl.classList.remove('preset-loading-full');
+    updatePreview();
+  } catch (err) {
+    console.error('Failed to load full texture:', err);
+    swatchEl.classList.remove('preset-loading-full');
+  }
 }
 
 // ── Accessibility: Modal focus trap ───────────────────────────────────────────
@@ -510,7 +552,7 @@ function wireEvents() {
 
   // Scale V — when lock is on, mirror to U
   const applyScaleV = (v) => {
-    v = Math.max(0.05, Math.min(10, v));
+    v = Math.max(0.01, Math.min(10, v));
     settings.scaleV = v;
     scaleVSlider.value = scaleToPos(v);
     scaleVVal.value = v;
@@ -999,9 +1041,6 @@ function distSqPointToTri(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
 }
 
 // ── Spatial grid for fast sphere queries ──────────────────────────────────
-let _spatialGrid = null;
-let _spatialCellSize = 0;
-let _spatialMinX = 0, _spatialMinY = 0, _spatialMinZ = 0;
 
 function buildSpatialGrid(centroids, triCount, bounds) {
   const vol = bounds.size.x * bounds.size.y * bounds.size.z;
@@ -1691,10 +1730,11 @@ async function handleModelFile(file) {
 
     // Auto-select first preset on first load
     if (!activeMapEntry && PRESETS.length > 0) {
-      activeMapEntry = PRESETS[0];
-      activeMapName.textContent = PRESETS[0].name;
-      const swatches = document.querySelectorAll('.preset-swatch');
-      if (swatches.length > 0) swatches[0].classList.add('active');
+      const idx = PRESETS.findIndex(p => p != null);
+      if (idx >= 0) {
+        const swatches = document.querySelectorAll('.preset-swatch');
+        if (swatches[idx]) selectPreset(idx, swatches[idx]);
+      }
     }
     mappingSelect.value = String(settings.mappingMode);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';

@@ -13,6 +13,7 @@ export default {
   "sections.displacementMap": "ディスプレイスメントマップ",
   "ui.uploadCustomMap": "カスタムマップをアップロード",
   "ui.noMapSelected": "マップが選択されていません",
+  "ui.loadingTextures": "テクスチャを読み込み中…",
   "sections.projection": "投影",
   "labels.mode": "モード",
   "projection.triplanar": "トライプラナー",
